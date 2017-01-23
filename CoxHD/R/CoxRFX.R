@@ -71,7 +71,7 @@ ecoxph <- function(X,surv, tol=1e-3, max.iter=50){
 #' @author mg14
 #' @export
 #' @example inst/example/CoxRFX-example.R
-CoxRFX <- function(Z, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups), tol=1e-3, max.iter=50, sigma0 = 0.1, nu = 0,  penalize.mu = FALSE, sigma.hat=c("df","MLE","REML","BLUP"), verbose=FALSE){
+CoxMFX <- function(Z, X=NULL, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups), tol=1e-3, max.iter=50, sigma0 = 0.1, nu = 0,  penalize.mu = FALSE, sigma.hat=c("df","MLE","REML","BLUP"), verbose=FALSE){
 	if(class(Z)=="data.frame"){
 		Z = as.matrix(Z)
 		Z.df <- TRUE
@@ -92,22 +92,30 @@ CoxRFX <- function(Z, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups),
 	iter = 1
 	mu <- mu0ld <- rep(0, nGroups)
 	names(mu) <- uniqueGroups
-	beta = rep(1,ncol(Z)+length(which.mu))
-	beta0ld = rep(0,ncol(Z)+length(which.mu))
+	if(!is.null(X)){
+		f <- ncol(X)
+		if(is.null(colnames(X))) colnames(X) <- paste0("X.", 1:ncol(X))
+	} 
+	else f <- 0
+	beta = rep(1,ncol(Z)+length(which.mu) + f)
+	beta0ld = rep(0,ncol(Z)+length(which.mu) + f)
 	sigma2.mu = 42
 	if(!is.null(which.mu)) 
 		if(!penalize.mu)
-			sumTerm <- "sumZ" 
+			fixedEff <- "sumZ" 
 		else
-			sumTerm <- "ridge(sumZ, theta=1/sigma2.mu, scale=FALSE)"
-	else sumTerm <- character(0)
+			fixedEff <- "ridge(sumZ, theta=1/sigma2.mu, scale=FALSE)"
+	else fixedEff <- character(0)
+	if(!is.null(X)){
+		fixedEff <- paste(fixedEff, "+ X")
+	}
 	while((max(abs(beta-beta0ld)) > tol | max(abs(mu - mu0ld)) > tol | max(abs(sigma2 - sigma0ld)) > tol) & iter < max.iter){
 		beta0ld = beta
 		sigma0ld <- sigma2
 		mu0ld <- mu
 		formula <- formula(paste("surv ~", paste(c(sapply(1:nGroups, function(i) paste("ridge(ZZ[[",i,"]], theta=1/sigma2[",i,"], scale=FALSE)", sep="")), 
 								#ifelse(!is.null(which.mu),"ridge(sumZ, theta=1/sigma.mu, scale=FALSE)","")), 
-								sumTerm), 
+								fixedEff), 
 						collapse=" + ")))
 		fit <- coxph(formula)
 		if(any(is.na(coef(fit)))){
@@ -115,7 +123,7 @@ CoxRFX <- function(Z, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups),
 			break
 		}
 		if(!is.null(which.mu))
-			mu[which.mu] <- coef(fit)[-(1:ncol(Z))]
+			mu[which.mu] <- coef(fit)[ncol(Z) + seq_along(which.mu)]
 		if(verbose) cat("mu", mu, "\n", sep="\t")
 		names(fit$df) <- c(uniqueGroups, rep("Offset", length(which.mu)>0))
 		if(verbose) cat("df", fit$df,"\n", sep="\t")
@@ -158,14 +166,18 @@ CoxRFX <- function(Z, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups),
 	fit$Z = Z[,order(o)]
 	fit$surv = surv
 	C <- rbind(diag(1, ncol(Z)),t(as.matrix(MakeInteger(groups)[which.mu]))) ## map from centred to uncentred coefficients 
+	if(!is.null(X))
+		C <- cbind( rbind(C, matrix(0, ncol=ncol(C), nrow=f) ), rbind( matrix(0, ncol=f, nrow=nrow(C)), diag(1, f)))
 	fit$groups = groups[order(o)]
 	var = fit$var
 	var2 = fit$var2
-	colnames(var) <- rownames(var) <- colnames(var2) <- rownames(var2) <- rownames(C) <- c(colnames(Z), which.mu)
-	colnames(C) <- colnames(Z)
+	colnames(var) <- rownames(var) <- colnames(var2) <- rownames(var2) <- rownames(C) <- c(colnames(Z), which.mu, colnames(X))
+	colnames(C) <- c(colnames(Z), colnames(X))
 	p <- ncol(Z)
-	i <- c(order(o), (1:ncol(var))[-p:-1])
-	j <- order(o)
+	i <- 1:nrow(C)
+	i[1:p] <- order(o)
+	j <- 1:ncol(C)
+	j[1:p] <- order(o)
 	fit$C <- C[i,j]
 	fit$Hinv <- var[i,i] ## Hinv 
 	fit$V <- var2[i,i] ## Hinv I Hinv
@@ -173,8 +185,9 @@ CoxRFX <- function(Z, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups),
 	fit$z2 <- (fit$coefficients / sqrt(diag(var2)))[i] ## z-scores of centred coefficients (var2)
 	fit$var = (t(C) %*% var %*% C)[j,j] ## covariance of uncentred coef
 	fit$var2 = (t(C) %*% var2 %*% C)[j,j] ## covariance of uncentred coef (var2)
-	fit$mu.var = var[-(1:p),-(1:p)] ## covariance of mean
-	fit$mu.var2 = var2[-(1:p),-(1:p)] ## covariance of mean (var2)
+	w <- ncol(Z) + seq_along(which.mu)
+	fit$mu.var = var[w,w] ## covariance of mean
+	fit$mu.var2 = var2[w,w] ## covariance of mean (var2)
 	fit$means = fit$means[1:p][j]
 	fit$coefficients <- (fit$coefficients %*% C)[j]
 	names(fit$means) <- names(fit$coefficients) <-  colnames(Z)[j]
@@ -193,7 +206,7 @@ CoxRFX <- function(Z, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups),
 	call["formula"] <- call("foo",formula=formula)["formula"]
 	fit$terms <- terms(formula)
 	fit$call <- call
-	class(fit) <- c("CoxRFX", class(fit))
+	class(fit) <- c("CoxMFX", class(fit))
 	return(fit)
 }
 
