@@ -3,6 +3,144 @@
 # Author: mg14
 ###############################################################################
 
+CoxMFX <- function(Z, X=NULL, surv, groups = rep(1, ncol(Z)), which.mu = unique(groups), tol=1e-3, max.iter=50, sigma0 = 0.1, nu = 0,  penalize.mu = FALSE, sigma.hat=c("df","MLE","REML","BLUP"), verbose=FALSE){
+	if(class(Z)=="data.frame"){
+		Z = as.matrix(Z)
+		Z.df <- TRUE
+	}else
+		Z.df <- FALSE
+	if(is.null(colnames(Z)))
+		colnames(Z) <- make.names(1:ncol(Z))
+	sigma.hat = match.arg(sigma.hat)
+	o <- order(groups)
+	Z <- Z[,o]
+	groups <- factor(groups[o])
+	uniqueGroups <- levels(groups)
+	ZZ <- lapply(uniqueGroups, function(i) Z[,groups==i, drop=FALSE])
+	names(ZZ) <- uniqueGroups
+	sumZ <- sapply(which.mu, function(i) rowSums(ZZ[[i]]))
+	nGroups = length(uniqueGroups)
+	sigma2 <- sigma0ld <- rep(ifelse(sigma0>0, sigma0,1), nGroups)
+	iter = 1
+	mu <- mu0ld <- rep(0, nGroups)
+	names(mu) <- uniqueGroups
+	if(!is.null(X)){
+		f <- ncol(X)
+		if(is.null(colnames(X))) colnames(X) <- paste0("X.", 1:ncol(X))
+	} 
+	else f <- 0
+	beta = rep(1,ncol(Z)+length(which.mu) + f)
+	beta0ld = rep(0,ncol(Z)+length(which.mu) + f)
+	sigma2.mu = 42
+	if(!is.null(which.mu)) 
+		if(!penalize.mu)
+			fixedEff <- "sumZ" 
+		else
+			fixedEff <- "ridge(sumZ, theta=1/sigma2.mu, scale=FALSE)"
+	else fixedEff <- character(0)
+	if(!is.null(X)){
+		fixedEff <- paste(fixedEff, "+ X")
+	}
+	while((max(abs(beta-beta0ld)) > tol | max(abs(mu - mu0ld)) > tol | max(abs(sigma2 - sigma0ld)) > tol) & iter < max.iter){
+		beta0ld = beta
+		sigma0ld <- sigma2
+		mu0ld <- mu
+		formula <- formula(paste("surv ~", paste(c(sapply(1:nGroups, function(i) paste("ridge(ZZ[[",i,"]], theta=1/sigma2[",i,"], scale=FALSE)", sep="")), 
+										#ifelse(!is.null(which.mu),"ridge(sumZ, theta=1/sigma.mu, scale=FALSE)","")), 
+										fixedEff), 
+								collapse=" + ")))
+		fit <- coxph(formula)
+		if(any(is.na(coef(fit)))){
+			warning(paste("NA during estimation (iter: ", iter, ", coef: ", paste(which(is.na(coef(fit)[order(o)])), sep=","), ")", sep=""))
+			break
+		}
+		if(!is.null(which.mu))
+			mu[which.mu] <- coef(fit)[ncol(Z) + seq_along(which.mu)]
+		if(verbose) cat("mu", mu, "\n", sep="\t")
+		names(fit$df) <- c(uniqueGroups, rep("Offset", length(which.mu)>0))
+		if(verbose) cat("df", fit$df,"\n", sep="\t")
+		sigma2 = sapply(uniqueGroups, function(i){
+					index <- which(groups==i) #& fit$coefficients > beta.thresh
+					if(sigma.hat=="BLUP")
+						(nu * sigma0 + sum((fit$coefficients[index])^2 ))/(nu + length(index))
+					else if(sigma.hat=="df")
+						(nu * sigma0 + sum((fit$coefficients[index])^2 ))/(nu + fit$df[i])
+					else if(sigma.hat == "MLE")
+						(nu * sigma0 + sum((fit$coefficients[index])^2 ) + sum(diag(solve(solve(fit$var)[index,index]))))/(nu + length(index))
+					else if(sigma.hat == "REML")
+						(nu * sigma0 + sum((fit$coefficients[index])^2 ) + sum(diag(fit$var)[index]))/(nu + length(index))
+				})
+		if(verbose) {
+			cat("sigma2", sigma2, "\n", sep="\t")
+			cat("loglik:", fit$loglik - c(0,fit$penalty[2] + 1/2 * sum(log(sigma2[groups]))),"\n", sep="\t")
+		}
+		if(penalize.mu){
+			if(sigma.hat=="BLUP")
+				sigma2.mu = (sigma0 * nu + sum((mu-0)^2)) / (nu + length(mu))
+			else if(sigma.hat=="df")
+				sigma2.mu = (sigma0 * nu + sum((mu-0)^2)) / (nu + fit$df["Offset"])
+			else if(sigma.hat == "MLE")
+				sigma2.mu = (nu * sigma0 + sum((mu-0)^2 ) + sum(diag(solve(solve(fit$var)[-(1:ncol(Z)),-(1:ncol(Z))]))))/(nu + length(mu))
+			else if(sigma.hat == "REML")
+				sigma2.mu = (nu * sigma0 + sum((mu-0)^2 ) + sum(diag(fit$var)[-(1:ncol(Z))]))/(nu + length(mu))
+		}
+		
+		beta = fit$coefficients
+		iter = iter+1
+	}
+	if(iter == max.iter)
+		warning("Did not converge after ", max.iter, " iterations.")
+	fit$iter[1] <- iter
+	fit$sigma2 = sigma0ld
+	names(fit$sigma2) <- uniqueGroups
+	fit$sigma2.mu = sigma2.mu
+	fit$mu = mu
+	fit$Z = Z[,order(o)]
+	fit$surv = surv
+	C <- rbind(diag(1, ncol(Z)),t(as.matrix(MakeInteger(groups)[which.mu]))) ## map from centred to uncentred coefficients 
+	if(!is.null(X))
+		C <- cbind( rbind(C, matrix(0, ncol=ncol(C), nrow=f) ), rbind( matrix(0, ncol=f, nrow=nrow(C)), diag(1, f)))
+	fit$groups = groups[order(o)]
+	var = fit$var
+	var2 = fit$var2
+	colnames(var) <- rownames(var) <- colnames(var2) <- rownames(var2) <- rownames(C) <- c(colnames(Z), which.mu, colnames(X))
+	colnames(C) <- c(colnames(Z), colnames(X))
+	p <- ncol(Z)
+	i <- 1:nrow(C)
+	i[1:p] <- order(o)
+	j <- 1:ncol(C)
+	j[1:p] <- order(o)
+	fit$C <- C[i,j]
+	fit$Hinv <- var[i,i] ## Hinv 
+	fit$V <- var2[i,i] ## Hinv I Hinv
+	fit$z <- (fit$coefficients / sqrt(diag(var)))[i] ## z-scores of centred coefficients
+	fit$z2 <- (fit$coefficients / sqrt(diag(var2)))[i] ## z-scores of centred coefficients (var2)
+	fit$var = (t(C) %*% var %*% C)[j,j] ## covariance of uncentred coef
+	fit$var2 = (t(C) %*% var2 %*% C)[j,j] ## covariance of uncentred coef (var2)
+	w <- ncol(Z) + seq_along(which.mu)
+	fit$mu.var = var[w,w] ## covariance of mean
+	fit$mu.var2 = var2[w,w] ## covariance of mean (var2)
+	fit$means = fit$means[1:p][j]
+	fit$coefficients <- (fit$coefficients %*% C)[j]
+	names(fit$means) <- names(fit$coefficients) <-  colnames(Z)[j]
+	fit$terms <- fit$terms[1:length(uniqueGroups)]
+	fit$penalized.loglik <- fit$loglik[2] - fit$penalty[2] - 1/2 * sum(log(fit$sigma2[groups]))
+	## Fake call for predict.coxph and survfit.coxph
+	call <- match.call()
+	if(Z.df){
+		call["data"] <- call["Z"]
+		formula <- as.formula(paste(as.character(call["surv"]),"~",paste(colnames(Z)[j], collapse="+")))
+	}else{
+		formula <- as.formula(paste(as.character(call["surv"]),"~",as.character(call["Z"])))
+	}
+	attr(formula,".Environment") <- parent.frame()
+	fit$formula <- formula
+	call["formula"] <- call("foo",formula=formula)["formula"]
+	fit$terms <- terms(formula)
+	fit$call <- call
+	class(fit) <- c("CoxMFX", class(fit))
+	return(fit)
+}
 
 SimSurvTDNonp <- function(dataFrame, coef, time0, time1, event, timeTpl, coefTpl) {
 	w <- which(timeTpl < time1 & timeTpl > time0)
